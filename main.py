@@ -13,6 +13,7 @@ from typing import List
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from logging_config import setup_logging
 from neo4j_conn import Neo4jService
+from datetime import datetime
 
 # Загрузка и проверка переменных окружения
 load_dotenv()
@@ -41,6 +42,9 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app: FastAPI):
     logger.info("Starting scheduler")
     scheduler.start()
+    # Немедленное выполнение реиндексации при старте
+    await reindex_articles()
+    logger.info(f"Next reindexing scheduled for: {scheduler.get_job('reindex_articles').next_run_time}")
     yield
     logger.info("Shutting down scheduler")
     scheduler.shutdown()
@@ -104,7 +108,13 @@ async def reindex_articles():
         logger.error(f"Reindexing failed: {str(e)}")
 
 # Настройка шедулера
-scheduler.add_job(reindex_articles, 'interval', hours=1)
+scheduler.add_job(
+    reindex_articles,
+    'interval',
+    hours=1,
+    next_run_time=datetime.now(),
+    id='reindex_articles'
+)
 
 # Эндпоинт для поиска
 @app.post(
