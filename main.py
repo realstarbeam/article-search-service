@@ -1,7 +1,7 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 from neo4j import GraphDatabase
 from meilisearch_python_async import Client as MeiliClient
 from meilisearch_python_async.errors import MeilisearchApiError
@@ -10,17 +10,15 @@ from dotenv import load_dotenv
 import asyncio
 from contextlib import asynccontextmanager
 from typing import List
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from logging_config import setup_logging
+from neo4j_conn import Neo4jService
 
 # Загрузка и проверка переменных окружения
 load_dotenv()
-REQUIRED_ENV_VARS = ["NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "MEILISEARCH_URL"]
+REQUIRED_ENV_VARS = ["NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "MEILISEARCH_URL", "BETTERSTACK_TOKEN", "BETTERSTACK_URL"]
 for var in REQUIRED_ENV_VARS:
     if not os.getenv(var):
-        logger.error(f"Missing required environment variable: {var}")
         raise ValueError(f"Missing required environment variable: {var}")
 
 # Конфигурация
@@ -29,6 +27,11 @@ NEO4J_USER = os.getenv("NEO4J_USER")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 MEILISEARCH_URL = os.getenv("MEILISEARCH_URL")
 MEILISEARCH_API_KEY = os.getenv("MEILISEARCH_API_KEY", "")
+BETTERSTACK_TOKEN = os.getenv("BETTERSTACK_TOKEN")
+BETTERSTACK_URL = os.getenv("BETTERSTACK_URL")
+
+# Настройка логирования
+logger = setup_logging(token=BETTERSTACK_TOKEN, url=BETTERSTACK_URL)
 
 # Инициализация шедулера
 scheduler = AsyncIOScheduler()
@@ -36,11 +39,11 @@ scheduler = AsyncIOScheduler()
 # Lifespan handler для управления шедулером
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting scheduler")
     scheduler.start()
-    logger.info("Scheduler started")
     yield
+    logger.info("Shutting down scheduler")
     scheduler.shutdown()
-    logger.info("Scheduler shutdown")
 
 # Инициализация FastAPI
 app = FastAPI(
@@ -50,10 +53,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Middleware для логирования HTTP-запросов
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Request: {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response: {response.status_code}")
+    return response
+
 # Модель для запроса поиска
 class SearchQuery(BaseModel):
-    query: str
-    """Search query string for article lookup."""
+    query: str = Field(..., max_length=500)
+    """Search query string for article lookup (max 500 characters)."""
 
 # Модель для ответа
 class SearchResult(BaseModel):
@@ -62,30 +73,11 @@ class SearchResult(BaseModel):
     description: str
     """Article data with ID, title, and description."""
 
-# Подключение к Neo4j с контекстным менеджером
-class Neo4jService:
-    def __init__(self, uri: str, user: str, password: str):
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        if self.driver:
-            self.driver.close()
-            logger.info("Neo4j connection closed")
-
-    def get_articles(self) -> List[dict]:
-        with self.driver.session() as session:
-            result = session.run("MATCH (n:Article) RETURN n.id, n.title, n.description")
-            return [{"id": record["n.id"], "title": record["n.title"], "description": record["n.description"]} for record in result]
-
 # Подключение к Meilisearch
 async def get_meili_client() -> MeiliClient:
-    return MeiliClient(MEILISEARCH_URL, MEILISEARCH_API_KEY)
+    client = MeiliClient(MEILISEARCH_URL, MEILISEARCH_API_KEY)
+    logger.info("Meilisearch client initialized")
+    return client
 
 # Функция реиндексации
 async def reindex_articles():
@@ -93,6 +85,7 @@ async def reindex_articles():
         logger.info("Starting reindexing...")
         with Neo4jService(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD) as neo4j_service:
             articles = neo4j_service.get_articles()
+            logger.info(f"Retrieved {len(articles)} articles for reindexing")
 
         async with await get_meili_client() as client:
             try:
@@ -102,10 +95,11 @@ async def reindex_articles():
                     await client.create_index("articles", primary_key="id")
                     logger.info("Created Meilisearch index 'articles'")
                 else:
+                    logger.error(f"Meilisearch error during reindexing: {str(e)}")
                     raise
             index = client.index("articles")
             await index.add_documents(articles)
-        logger.info("Reindexing completed.")
+            logger.info(f"Reindexed {len(articles)} articles in Meilisearch")
     except Exception as e:
         logger.error(f"Reindexing failed: {str(e)}")
 
@@ -119,11 +113,19 @@ scheduler.add_job(reindex_articles, 'interval', hours=1)
     summary="Search articles",
     description="Search articles by query string using Meilisearch."
 )
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(2),
+    retry=retry_if_exception_type(MeilisearchApiError),
+    before_sleep=lambda retry_state: logger.warning(f"Retrying Meilisearch search: attempt {retry_state.attempt_number}")
+)
 async def search_articles(query: SearchQuery):
+    logger.info(f"Search request for query: {query.query}")
     try:
         async with await get_meili_client() as client:
             index = client.index("articles")
             results = await index.search(query.query, attributes_to_retrieve=["id", "title", "description"])
+            logger.info(f"Meilisearch returned {len(results.hits)} hits for query: {query.query}")
             return [SearchResult(**hit) for hit in results.hits]
     except MeilisearchApiError as e:
         logger.error(f"Search failed: Meilisearch error - {str(e)}")
@@ -131,6 +133,35 @@ async def search_articles(query: SearchQuery):
     except Exception as e:
         logger.error(f"Search failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+# Эндпоинт для проверки состояния
+@app.get(
+    "/health",
+    summary="Health check",
+    description="Check the health of Neo4j and Meilisearch connections."
+)
+async def health_check():
+    health_status = {"neo4j": "healthy", "meilisearch": "healthy"}
+    logger.info("Health check requested")
+
+    try:
+        with Neo4jService(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD) as neo4j_service:
+            neo4j_service.get_articles(limit=1)  # Проверка соединения
+    except Exception as e:
+        health_status["neo4j"] = f"unhealthy: {str(e)}"
+        logger.error(f"Neo4j health check failed: {str(e)}")
+
+    try:
+        async with await get_meili_client() as client:
+            await client.get_index("articles")  # Проверка соединения
+    except Exception as e:
+        health_status["meilisearch"] = f"unhealthy: {str(e)}"
+        logger.error(f"Meilisearch health check failed: {str(e)}")
+
+    if all(status == "healthy" for status in health_status.values()):
+        return {"status": "healthy", "details": health_status}
+    else:
+        raise HTTPException(status_code=503, detail={"status": "unhealthy", "details": health_status})
 
 # Запуск сервера
 if __name__ == "__main__":
