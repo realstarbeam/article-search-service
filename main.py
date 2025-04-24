@@ -14,6 +14,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_t
 from logging_config import setup_logging
 from neo4j_conn import Neo4jService
 from datetime import datetime
+from transliterate import translit
 
 # Загрузка и проверка переменных окружения
 load_dotenv()
@@ -102,6 +103,8 @@ async def reindex_articles():
                     logger.error(f"Meilisearch error during reindexing: {str(e)}")
                     raise
             index = client.index("articles")
+            # Настройка searchable attributes
+            await index.update_searchable_attributes(["title", "description", "content"])
             await index.add_documents(articles)
             logger.info(f"Reindexed {len(articles)} articles in Meilisearch")
     except Exception as e:
@@ -121,7 +124,7 @@ scheduler.add_job(
     "/search",
     response_model=List[SearchResult],
     summary="Search articles",
-    description="Search articles by query string using Meilisearch."
+    description="Search articles by query string using Meilisearch with transliteration."
 )
 @retry(
     stop=stop_after_attempt(3),
@@ -132,10 +135,21 @@ scheduler.add_job(
 async def search_articles(query: SearchQuery):
     logger.info(f"Search request for query: {query.query}")
     try:
+        # Преобразуем запрос в латиницу, если он на кириллице
+        try:
+            transliterated_query = translit(query.query, 'ru', reversed=True)
+        except Exception:
+            transliterated_query = query.query  # Если транслитерация не удалась, используем оригинал
+        logger.info(f"Transliterated query: {transliterated_query}")
+
         async with await get_meili_client() as client:
             index = client.index("articles")
-            results = await index.search(query.query, attributes_to_retrieve=["id", "title", "description"])
-            logger.info(f"Meilisearch returned {len(results.hits)} hits for query: {query.query}")
+            # Ищем по транслитерированному запросу
+            results = await index.search(
+                transliterated_query,
+                attributes_to_retrieve=["id", "title", "description"]
+            )
+            logger.info(f"Meilisearch returned {len(results.hits)} hits for query: {transliterated_query}")
             return [SearchResult(**hit) for hit in results.hits]
     except MeilisearchApiError as e:
         logger.error(f"Search failed: Meilisearch error - {str(e)}")
