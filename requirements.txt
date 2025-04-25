@@ -1,6 +1,6 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-neo4j==5.24.0
+fastapi==0.115.2
+uvicorn==0.32.0
+neo4j==5.25.0
 meilisearch-python-async==1.8.1
 apscheduler==3.10.4
 python-dotenv==1.0.1
@@ -10,4 +10,4 @@ httpx==0.27.2
 tenacity==9.0.0
 pytest==8.3.3
 transliterate==1.10.2
-deep-translator==1.11.4
+slowapi==0.1.9
